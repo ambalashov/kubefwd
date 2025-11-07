@@ -89,8 +89,24 @@ enhancements, and documentation only.
 
 Forward all services for the namespace `the-project`. Kubefwd finds the first Pod associated with each Kubernetes service found in the Namespace and port forwards it based on the Service spec to a local IP  address and port. A domain name is added to your /etc/hosts file pointing to the local IP.
 
-### Update
-Forwarding of headlesss Service is currently supported, Kubefwd forward all Pods for headless service; At the same time, the namespace-level service monitoring is supported. When a new service is created or the old service is deleted under the namespace, kubefwd can automatically start/end forwarding; Supports Pod-level forwarding monitoring. When the forwarded Pod is deleted (such as updating the deployment, etc.), the forwarding of the service to which the pod belongs is automatically restarted;
+### Recent Updates
+
+**Service List Filtering** (Latest)
+- Forward specific services with specific ports using `--service-list` flag
+- Service-level forwarding for improved resource efficiency (one IP per service)
+- Endpoint readiness checks before establishing port-forwards
+- Support for loading service lists from configuration files
+- Port-level filtering to forward only needed ports
+
+**Dynamic Service Discovery**
+- Namespace-level service monitoring with automatic start/stop of port-forwarding when services are created or deleted
+- Pod-level forwarding monitoring with automatic restart when pods are updated or deleted
+- Headless service support with forwarding to all pods or selective first-pod forwarding
+
+**Enhanced Stability**
+- Debounced pod synchronization to reduce API server load
+- Improved error handling for service endpoints
+- Better support for service and pod lifecycle events
 
 ```bash
 sudo kubefwd svc -n the-project
@@ -112,6 +128,69 @@ Forward more than one service using the `in` clause:
 ```bash
 sudo kubefwd svc -l "app in (app1, app2)"
 ```
+
+## Service List Filtering
+
+Forward specific services with specific ports using the `--service-list` flag:
+
+```bash
+# Forward a single service with a specific port
+sudo kubefwd svc --service-list myapp:8080
+
+# Forward a service with multiple ports
+sudo kubefwd svc --service-list myapp:8080,8081,9090
+
+# Forward multiple services with specific ports
+sudo kubefwd svc --service-list myapp:8080 --service-list api:443
+
+# Specify namespace in the service name
+sudo kubefwd svc --service-list myapp.production:8080 --service-list api.staging:443
+
+# Combine with -n flag (service names without namespace use the -n value)
+sudo kubefwd svc -n production --service-list myapp:8080 --service-list api:443
+```
+
+Supported formats for `--service-list`:
+- `service:port` - requires `-n` flag to specify namespace
+- `service.namespace:port` - namespace auto-discovered
+- `service:port1,port2,port3` - multiple ports for a service
+
+**Note:** `--service-list` is mutually exclusive with `-l` (label selector) and `-f` (field selector).
+
+### Service List in Configuration File
+
+You can also specify the service list in a configuration file:
+
+```bash
+sudo kubefwd svc -z path/to/fwdconf.yml
+```
+
+Example configuration file:
+```yaml
+baseUnreservedIP: 127.1.27.1
+
+# Service list - CLI flag --service-list will override this
+serviceList:
+  - myapp.default:8080,8081
+  - api.production:443,8443
+
+serviceConfigurations:
+  - name: myapp.default
+    ip: 127.1.28.1
+  - name: api.production
+    ip: 127.1.28.2
+```
+
+### Benefits of Service List Filtering
+
+Using `--service-list` provides several advantages:
+
+1. **Efficient Resource Usage**: Only forwards specified services and ports instead of all services in a namespace
+2. **Simplified Networking**: One IP address per service (instead of per pod)
+3. **Automatic Load Balancing**: Kubernetes routes traffic to healthy pods
+4. **Cleaner `/etc/hosts`**: Fewer hostname entries to manage
+5. **Service-Level Forwarding**: For non-headless services, forwards directly to the service endpoint
+6. **Selective Port Forwarding**: Only forward the ports you need, avoiding conflicts
 
 ## Help
 
@@ -145,21 +224,25 @@ Examples:
   kubefwd svc -n the-project -m 80:8080 -m 443:1443
   kubefwd svc -n the-project -z path/to/conf.yml
   kubefwd svc -n the-project -r svc.ns:127.3.3.1
+  kubefwd svc --service-list myapp:8080 --service-list api:443
+  kubefwd svc --service-list myapp.production:8080,8081
   kubefwd svc --all-namespaces
 
 Flags:
-  -A, --all-namespaces          Enable --all-namespaces option like kubectl.
-  -x, --context strings         specify a context to override the current context
-  -d, --domain string           Append a pseudo domain name to generated host names.
-  -f, --field-selector string   Field selector to filter on; supports '=', '==', and '!=' (e.g. -f metadata.name=service-name).
-  -z, --fwd-conf string         Define an IP reservation configuration
-  -h, --help                    help for services
-  -c, --kubeconfig string       absolute path to a kubectl config file
-  -m, --mapping strings         Specify a port mapping. Specify multiple mapping by duplicating this argument.
-  -n, --namespace strings       Specify a namespace. Specify multiple namespaces by duplicating this argument.
-  -r, --reserve strings         Specify an IP reservation. Specify multiple reservations by duplicating this argument.
-  -l, --selector string         Selector (label query) to filter on; supports '=', '==', and '!=' (e.g. -l key1=value1,key2=value2).
-  -v, --verbose                 Verbose output.
+  -A, --all-namespaces             Enable --all-namespaces option like kubectl.
+  -x, --context strings            specify a context to override the current context
+  -d, --domain string              Append a pseudo domain name to generated host names.
+  -f, --field-selector string      Field selector to filter on; supports '=', '==', and '!=' (e.g. -f metadata.name=service-name).
+  -z, --fwd-conf string            Define an IP reservation configuration
+  -h, --help                       help for services
+  -c, --kubeconfig string          absolute path to a kubectl config file
+  -m, --mapping strings            Specify a port mapping. Specify multiple mapping by duplicating this argument.
+  -n, --namespace strings          Specify a namespace. Specify multiple namespaces by duplicating this argument.
+  -r, --reserve strings            Specify an IP reservation. Specify multiple reservations by duplicating this argument.
+  -l, --selector string            Selector (label query) to filter on; supports '=', '==', and '!=' (e.g. -l key1=value1,key2=value2).
+      --service-list strings       Specify services with specific ports to forward (format: service:port or service.namespace:port). Multiple ports: service:port1,port2
+  -t, --timeout int                Specify a timeout seconds for the port forwarding. (default 300)
+  -v, --verbose                    Verbose output.
 ```
 
 ### License
