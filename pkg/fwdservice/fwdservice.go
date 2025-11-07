@@ -77,6 +77,12 @@ type ServiceFWD struct {
 
 	ForwardConfigurationPath string   // file path to IP reservation configuration
 	ForwardIPReservations    []string // cli passed IP reservations
+
+	ServiceListFilter *ServiceListFilter // filter for specific services/ports from --service-list flag
+
+	// ForwardToService indicates we should forward to the service endpoint
+	// directly instead of individual pods (enabled for --service-list on non-headless services)
+	ForwardToService bool
 }
 
 /*
@@ -87,6 +93,18 @@ add port map
 type PortMap struct {
 	SourcePort string
 	TargetPort string
+}
+
+// ServicePortSpec specifies a service and its allowed ports
+type ServicePortSpec struct {
+	ServiceName string  // Service name (without namespace)
+	Namespace   string  // Namespace where service lives
+	Ports       []int32 // List of ports to forward
+}
+
+// ServiceListFilter contains service-port specifications for filtering
+type ServiceListFilter struct {
+	Specs map[string]*ServicePortSpec // key: "service.namespace"
 }
 
 // String representation of a ServiceFWD returns a unique name
@@ -130,6 +148,14 @@ func (svcFwd *ServiceFWD) SyncPodForwards(force bool) {
 
 		defer func() { svcFwd.LastSyncedAt = time.Now() }()
 
+		// NEW: If ForwardToService is enabled and service is not headless,
+		// forward directly to the service endpoint instead of individual pods
+		if svcFwd.ForwardToService && !svcFwd.Headless {
+			svcFwd.SetupServiceForward()
+			return
+		}
+
+		// EXISTING: Pod-based forwarding for headless services or when not using service forwarding
 		k8sPods := svcFwd.GetPodsForService()
 
 		// If no pods are found currently. Will try again next re-sync period.
@@ -161,8 +187,18 @@ func (svcFwd *ServiceFWD) SyncPodForwards(force bool) {
 			// if this is a headless service forward the first pod from the
 			// service name, then subsequent pods from their pod name
 			if svcFwd.Headless {
-				svcFwd.LoopPodsToForward([]v1.Pod{k8sPods[0]}, false)
-				svcFwd.LoopPodsToForward(k8sPods, true)
+				// When using --service-list, only forward first pod (resource efficient)
+				// Otherwise, forward all pods (StatefulSet pod-specific addressing)
+				if svcFwd.ServiceListFilter != nil {
+					// --service-list active: forward only first pod
+					log.Debugf("Headless service %s with --service-list: forwarding only first pod", svcFwd)
+					svcFwd.LoopPodsToForward([]v1.Pod{k8sPods[0]}, false)
+				} else {
+					// Traditional behavior: forward all pods with pod-specific names
+					log.Debugf("Headless service %s: forwarding all %d pods", svcFwd, len(k8sPods))
+					svcFwd.LoopPodsToForward([]v1.Pod{k8sPods[0]}, false)
+					svcFwd.LoopPodsToForward(k8sPods, true)
+				}
 				return
 			}
 
@@ -208,6 +244,140 @@ func (svcFwd *ServiceFWD) SyncPodForwards(force bool) {
 	} else {
 		// Queue sync
 		svcFwd.SyncDebouncer(sync)
+	}
+}
+
+// SetupServiceForward creates a single port-forward to the service endpoint
+// instead of forwarding to individual pods. This is used when ForwardToService is true.
+// Benefits: one IP per service (vs one IP per pod), simpler /etc/hosts, K8s load balancing
+func (svcFwd *ServiceFWD) SetupServiceForward() {
+	defer func() { svcFwd.LastSyncedAt = time.Now() }()
+
+	serviceName := svcFwd.Svc.Name
+
+	// Check if we already have a service forward set up
+	if _, found := svcFwd.PortForwards[serviceName]; found {
+		log.Debugf("Service forward already exists for %s", svcFwd)
+		return
+	}
+
+	// Check if service has endpoints with ready addresses
+	endpoints, err := svcFwd.ClientSet.CoreV1().Endpoints(svcFwd.Namespace).Get(
+		context.TODO(), serviceName, metav1.GetOptions{})
+	if err != nil {
+		log.Warnf("Service %s.%s endpoint lookup failed: %v, skipping port-forward",
+			serviceName, svcFwd.Namespace, err)
+		return
+	}
+
+	hasReadyEndpoints := false
+	for _, subset := range endpoints.Subsets {
+		if len(subset.Addresses) > 0 {
+			hasReadyEndpoints = true
+			break
+		}
+	}
+
+	if !hasReadyEndpoints {
+		log.Warnf("Service %s.%s has no ready endpoints available, skipping port-forward",
+			serviceName, svcFwd.Namespace)
+		return
+	}
+
+	svcFwd.NamespaceServiceLock.Lock()
+	defer svcFwd.NamespaceServiceLock.Unlock()
+
+	// Allocate single IP for the service (PodName empty = service-level allocation)
+	opts := fwdIp.ForwardIPOpts{
+		ServiceName:              serviceName,
+		PodName:                  "", // Empty indicates service-level allocation
+		Context:                  svcFwd.Context,
+		ClusterN:                 svcFwd.ClusterN,
+		NamespaceN:               svcFwd.NamespaceN,
+		Namespace:                svcFwd.Namespace,
+		Port:                     "",
+		ForwardConfigurationPath: svcFwd.ForwardConfigurationPath,
+		ForwardIPReservations:    svcFwd.ForwardIPReservations,
+	}
+
+	localIp, err := fwdnet.ReadyInterface(opts)
+	if err != nil {
+		log.Warnf("WARNING: error readying interface for service %s: %s\n", svcFwd, err)
+		return
+	}
+
+	serviceHostName := serviceName
+	if svcFwd.NamespaceN > 0 {
+		serviceHostName = serviceHostName + "." + svcFwd.Namespace
+	}
+	if svcFwd.ClusterN > 0 {
+		serviceHostName = serviceHostName + "." + svcFwd.Context
+	}
+
+	publisher := &fwdpub.Publisher{
+		PublisherName: "Services",
+		Output:        false,
+	}
+
+	// Create port forwards for each service port
+	for _, port := range svcFwd.Svc.Spec.Ports {
+		if port.Protocol == v1.ProtocolUDP {
+			log.Warnf("WARNING: Skipped Port-Forward for %s:%d - UDP not supported\n",
+				serviceHostName, port.Port)
+			continue
+		}
+
+		if !svcFwd.shouldForwardPort(port.Port) {
+			log.Debugf("Skipping port %d for service %s (not in filter)",
+				port.Port, svcFwd)
+			continue
+		}
+
+		podPort := strconv.Itoa(int(port.Port))
+		localPort := svcFwd.getPortMap(port.Port)
+
+		log.Printf("Port-Forward: %16s %s:%s to service %s:%d\n",
+			localIp.String(),
+			serviceHostName,
+			localPort,
+			serviceName,
+			port.Port,
+		)
+
+		pfo := &fwdport.PortForwardOpts{
+			Out:              publisher,
+			Config:           svcFwd.ClientConfig,
+			ClientSet:        svcFwd.ClientSet,
+			RESTClient:       svcFwd.RESTClient,
+			Context:          svcFwd.Context,
+			Namespace:        svcFwd.Namespace,
+			Service:          serviceName,
+			ServiceFwd:       svcFwd,
+			PodName:          "",          // Empty indicates service forwarding
+			ServiceName:      serviceName, // Used for service endpoint
+			PodPort:          podPort,
+			LocalIp:          localIp,
+			LocalPort:        localPort,
+			HostFile:         svcFwd.Hostfile,
+			ClusterN:         svcFwd.ClusterN,
+			NamespaceN:       svcFwd.NamespaceN,
+			Domain:           svcFwd.Domain,
+			Timeout:          svcFwd.Timeout,
+			ForwardToService: true, // Indicates service forwarding mode
+			ManualStopChan:   make(chan struct{}),
+			DoneChan:         make(chan struct{}),
+		}
+
+		go func(portForwardOpts *fwdport.PortForwardOpts) {
+			svcFwd.AddServicePod(portForwardOpts)
+			if err := portForwardOpts.PortForward(); err != nil {
+				select {
+				case <-portForwardOpts.ManualStopChan:
+				default:
+					log.Errorf("PortForward error on service %s: %s", serviceName, err.Error())
+				}
+			}
+		}(pfo)
 	}
 }
 
@@ -278,6 +448,13 @@ func (svcFwd *ServiceFWD) LoopPodsToForward(pods []v1.Pod, includePodNameInHost 
 					pod.Name,
 					port.TargetPort.String(),
 				)
+				continue
+			}
+
+			// Skip ports not in service-list filter
+			if !svcFwd.shouldForwardPort(port.Port) {
+				log.Debugf("Skipping port %d for service %s.%s (not in service-list filter)",
+					port.Port, svcFwd.Svc.Name, svcFwd.Namespace)
 				continue
 			}
 
@@ -357,9 +534,16 @@ func (svcFwd *ServiceFWD) LoopPodsToForward(pods []v1.Pod, includePodNameInHost 
 // AddServicePod
 func (svcFwd *ServiceFWD) AddServicePod(pfo *fwdport.PortForwardOpts) {
 	svcFwd.NamespaceServiceLock.Lock()
-	ServicePod := pfo.Service + "." + pfo.PodName
-	if _, found := svcFwd.PortForwards[ServicePod]; !found {
-		svcFwd.PortForwards[ServicePod] = pfo
+	var key string
+	if pfo.PodName == "" {
+		// Service-level forwarding - use service name as key
+		key = pfo.Service
+	} else {
+		// Pod-level forwarding - use service.pod format
+		key = pfo.Service + "." + pfo.PodName
+	}
+	if _, found := svcFwd.PortForwards[key]; !found {
+		svcFwd.PortForwards[key] = pfo
 	}
 	svcFwd.NamespaceServiceLock.Unlock()
 }
@@ -409,4 +593,31 @@ func (svcFwd *ServiceFWD) getPortMap(port int32) string {
 		}
 	}
 	return p
+}
+
+// shouldForwardPort checks if a port should be forwarded based on service-list filter
+func (svcFwd *ServiceFWD) shouldForwardPort(port int32) bool {
+	// No filter means forward all ports
+	if svcFwd.ServiceListFilter == nil {
+		return true
+	}
+
+	// Build key for this service
+	key := svcFwd.Svc.Name + "." + svcFwd.Namespace
+	spec, exists := svcFwd.ServiceListFilter.Specs[key]
+
+	// Service not in filter means forward all ports
+	if !exists {
+		return true
+	}
+
+	// Check if this specific port is in the allowed list
+	for _, allowedPort := range spec.Ports {
+		if port == allowedPort {
+			return true
+		}
+	}
+
+	// Port not in allowed list
+	return false
 }

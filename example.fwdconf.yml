@@ -1,4 +1,13 @@
 baseUnreservedIP: 127.1.27.1
+
+# Optional: Specify services with specific ports to forward
+# Format: service:port or service.namespace:port
+# Multiple ports: service:port1,port2
+# CLI flag --service-list will override this if provided
+serviceList:
+  - myapp.default:8080,8081
+  - api.production:443,8443
+
 serviceConfigurations:
   - # name of the target service
     # this will match a service in the first namespace
