@@ -63,7 +63,17 @@ func GetIp(opts ForwardIPOpts) (net.IP, error) {
 	ipRegistry.mutex.Lock()
 	defer ipRegistry.mutex.Unlock()
 
-	regKey := fmt.Sprintf("%d-%d-%s-%s", opts.ClusterN, opts.NamespaceN, opts.ServiceName, opts.PodName)
+	// Build registry key
+	// If PodName is empty, we're doing service-level allocation (one IP per service)
+	// Otherwise, we're doing pod-level allocation (one IP per pod, existing behavior)
+	var regKey string
+	if opts.PodName == "" {
+		// Service-level allocation: key = cluster-namespace-service
+		regKey = fmt.Sprintf("%d-%d-%s", opts.ClusterN, opts.NamespaceN, opts.ServiceName)
+	} else {
+		// Pod-level allocation: key = cluster-namespace-service-pod (existing behavior)
+		regKey = fmt.Sprintf("%d-%d-%s-%s", opts.ClusterN, opts.NamespaceN, opts.ServiceName, opts.PodName)
+	}
 
 	if ip, ok := ipRegistry.reg[regKey]; ok {
 		return ip, nil

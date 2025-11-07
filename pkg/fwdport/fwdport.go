@@ -63,8 +63,8 @@ type PortForwardOpts struct {
 	LocalIp    net.IP
 	LocalPort  string
 	// Timeout for the port-forwarding process
-	Timeout    int
-	HostFile   *HostFileWithLock
+	Timeout  int
+	HostFile *HostFileWithLock
 
 	// Context is a unique key (string) in kubectl config representing
 	// a user/cluster combination. Kubefwd uses context as the
@@ -89,6 +89,13 @@ type PortForwardOpts struct {
 	Hosts          []string
 	ManualStopChan chan struct{} // Send a signal on this to stop the portforwarding
 	DoneChan       chan struct{} // Listen on this channel for when the shutdown is completed.
+
+	// ForwardToService indicates we should forward to the service endpoint
+	// instead of a specific pod (used for --service-list optimization)
+	ForwardToService bool
+
+	// ServiceName is the name of the service to forward to (when ForwardToService is true)
+	ServiceName string
 }
 
 type pingingDialer struct {
@@ -148,11 +155,24 @@ func (pfo *PortForwardOpts) PortForward() error {
 
 	// if need to set timeout, set it here.
 	// restClient.Client.Timeout = 32
-	req := pfo.RESTClient.Post().
-		Resource("pods").
-		Namespace(pfo.Namespace).
-		Name(pfo.PodName).
-		SubResource("portforward")
+
+	// NEW: Choose between service or pod endpoint based on ForwardToService flag
+	var req *restclient.Request
+	if pfo.ForwardToService {
+		// Forward to service endpoint (NEW for --service-list optimization)
+		req = pfo.RESTClient.Post().
+			Resource("services").
+			Namespace(pfo.Namespace).
+			Name(pfo.ServiceName).
+			SubResource("portforward")
+	} else {
+		// Forward to pod endpoint (EXISTING behavior)
+		req = pfo.RESTClient.Post().
+			Resource("pods").
+			Namespace(pfo.Namespace).
+			Name(pfo.PodName).
+			SubResource("portforward")
+	}
 
 	pfStopChannel := make(chan struct{}, 1)      // Signal that k8s forwarding takes as input for us to signal when to stop
 	downstreamStopChannel := make(chan struct{}) // @TODO: can this be the same as pfStopChannel?
@@ -171,22 +191,37 @@ func (pfo *PortForwardOpts) PortForward() error {
 
 	}()
 
-	// Waiting until the pod is running
-	pod, err := pfo.WaitUntilPodRunning(downstreamStopChannel)
-	if err != nil {
-		pfo.Stop()
-		return err
-	} else if pod == nil {
-		// if err is not nil but pod is nil
-		// mean service deleted but pod is not runnning.
-		// No error, just return
-		pfo.Stop()
-		return nil
-	}
+	// NEW: Different initialization based on forwarding mode
+	var pod *v1.Pod
+	if pfo.ForwardToService {
+		// For service forwarding: verify service exists and has endpoints
+		_, err := pfo.ClientSet.CoreV1().Services(pfo.Namespace).Get(
+			context.TODO(), pfo.ServiceName, metav1.GetOptions{})
+		if err != nil {
+			pfo.Stop()
+			return fmt.Errorf("service %s not found: %v", pfo.ServiceName, err)
+		}
+		// Note: We don't listen for pod deletion when forwarding to service
+		// Kubernetes handles routing to healthy pods automatically
+	} else {
+		// EXISTING: For pod forwarding, wait for pod and watch for deletion
+		pod, err = pfo.WaitUntilPodRunning(downstreamStopChannel)
+		if err != nil {
+			pfo.Stop()
+			return err
+		}
+		if pod == nil {
+			// if err is not nil but pod is nil
+			// mean service deleted but pod is not runnning.
+			// No error, just return
+			pfo.Stop()
+			return nil
+		}
 
-	// Listen for pod is deleted
-	// @TODO need a test for this, does not seem to work as intended
-	go pfo.ListenUntilPodDeleted(downstreamStopChannel, pod)
+		// Listen for pod is deleted
+		// @TODO need a test for this, does not seem to work as intended
+		go pfo.ListenUntilPodDeleted(downstreamStopChannel, pod)
+	}
 
 	p := pfo.Out.MakeProducer(localNamedEndPoint)
 

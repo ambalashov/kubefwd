@@ -491,6 +491,8 @@ func (opts *NamespaceOpts) AddServiceHandler(obj interface{}) {
 		ForwardConfigurationPath: fwdConfigurationPath,
 		ForwardIPReservations:    fwdReservations,
 		ServiceListFilter:        opts.ServiceListFilter,
+		// Enable service forwarding when --service-list is used and service is not headless
+		ForwardToService: opts.ServiceListFilter != nil && svc.Spec.ClusterIP != "None",
 	}
 
 	// Add the service to the catalog of services being forwarded
