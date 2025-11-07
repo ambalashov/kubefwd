@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -60,6 +61,7 @@ var isAllNs bool
 var fwdConfigurationPath string
 var fwdReservations []string
 var timeout int
+var serviceList []string
 
 func init() {
 	// override error output from k8s.io/apimachinery/pkg/util/runtime
@@ -80,6 +82,7 @@ func init() {
 	Cmd.Flags().StringSliceVarP(&fwdReservations, "reserve", "r", []string{}, "Specify an IP reservation. Specify multiple reservations by duplicating this argument.")
 	Cmd.Flags().StringVarP(&fwdConfigurationPath, "fwd-conf", "z", "", "Define an IP reservation configuration")
 	Cmd.Flags().IntVarP(&timeout, "timeout", "t", 300, "Specify a timeout seconds for the port forwarding.")
+	Cmd.Flags().StringSliceVar(&serviceList, "service-list", []string{}, "Specify services with specific ports to forward (format: service:port or service.namespace:port). Multiple ports: service:port1,port2")
 
 }
 
@@ -226,6 +229,16 @@ Try:
 	listOptions.LabelSelector = cmd.Flag("selector").Value.String()
 	listOptions.FieldSelector = cmd.Flag("field-selector").Value.String()
 
+	// Check mutual exclusivity: --service-list cannot be used with -l or -f
+	if len(serviceList) > 0 {
+		if listOptions.LabelSelector != "" {
+			log.Fatalf("Error: --service-list cannot be used with -l (label selector). These flags are mutually exclusive.")
+		}
+		if listOptions.FieldSelector != "" {
+			log.Fatalf("Error: --service-list cannot be used with -f (field selector). These flags are mutually exclusive.")
+		}
+	}
+
 	// if no namespaces were specified via the flags, check config from the k8s context
 	// then explicitly set one to "default"
 	if len(namespaces) < 1 {
@@ -245,6 +258,18 @@ Try:
 				}
 			}
 		}
+	}
+
+	// Parse service-list and auto-discover namespaces
+	var svcListFilter *fwdservice.ServiceListFilter
+	if len(serviceList) > 0 {
+		var err error
+		svcListFilter, namespaces, err = ParseServiceList(serviceList, namespaces)
+		if err != nil {
+			log.Fatalf("Error parsing --service-list: %s\n", err.Error())
+		}
+		log.Printf("Service-list filter active: forwarding %d service(s) across %d namespace(s)",
+			len(svcListFilter.Specs), len(namespaces))
 	}
 
 	stopListenCh := make(chan struct{})
@@ -324,6 +349,7 @@ Try:
 				Domain:            domain,
 				ManualStopChannel: stopListenCh,
 				PortMapping:       mappings,
+				ServiceListFilter: svcListFilter,
 			}
 
 			go func(npo NamespaceOpts) {
@@ -375,6 +401,9 @@ type NamespaceOpts struct {
 	PortMapping []string
 
 	ManualStopChannel chan struct{}
+
+	// ServiceListFilter filters specific services and ports from --service-list flag
+	ServiceListFilter *fwdservice.ServiceListFilter
 }
 
 // watchServiceEvents sets up event handlers to act on service-related events.
@@ -422,6 +451,16 @@ func (opts *NamespaceOpts) AddServiceHandler(obj interface{}) {
 		return
 	}
 
+	// Filter services based on --service-list flag
+	if opts.ServiceListFilter != nil {
+		key := svc.Name + "." + svc.Namespace
+		if _, allowed := opts.ServiceListFilter.Specs[key]; !allowed {
+			log.Debugf("Skipping service %s.%s (not in --service-list filter)", svc.Name, svc.Namespace)
+			return
+		}
+		log.Infof("Service %s.%s matches --service-list filter", svc.Name, svc.Namespace)
+	}
+
 	// Check if service has a valid config to do forwarding
 	selector := labels.Set(svc.Spec.Selector).AsSelector().String()
 	if selector == "" {
@@ -451,6 +490,7 @@ func (opts *NamespaceOpts) AddServiceHandler(obj interface{}) {
 		PortMap:                  opts.ParsePortMap(mappings),
 		ForwardConfigurationPath: fwdConfigurationPath,
 		ForwardIPReservations:    fwdReservations,
+		ServiceListFilter:        opts.ServiceListFilter,
 	}
 
 	// Add the service to the catalog of services being forwarded
@@ -488,4 +528,100 @@ func (opts *NamespaceOpts) ParsePortMap(mappings []string) *[]fwdservice.PortMap
 		portList = append(portList, fwdservice.PortMap{SourcePort: portInfo[0], TargetPort: portInfo[1]})
 	}
 	return &portList
+}
+
+// ParseServiceList parses service-list entries and builds a filter
+// Supports formats: service:port, service.namespace:port, service.namespace.svc:port, service.namespace.svc.cluster.local:port
+// Returns the filter and a list of discovered namespaces to watch
+func ParseServiceList(serviceList []string, defaultNamespaces []string) (*fwdservice.ServiceListFilter, []string, error) {
+	if len(serviceList) == 0 {
+		return nil, defaultNamespaces, nil
+	}
+
+	filter := &fwdservice.ServiceListFilter{
+		Specs: make(map[string]*fwdservice.ServicePortSpec),
+	}
+
+	namespacesMap := make(map[string]bool)
+	// Start with default namespaces from -n flag
+	for _, ns := range defaultNamespaces {
+		namespacesMap[ns] = true
+	}
+
+	for _, entry := range serviceList {
+		// Split by colon to separate service name from ports
+		parts := strings.Split(entry, ":")
+		if len(parts) != 2 {
+			return nil, nil, fmt.Errorf("invalid service-list format '%s': expected format service:port or service.namespace:port", entry)
+		}
+
+		servicePart := parts[0]
+		portsPart := parts[1]
+
+		// Parse ports (can be comma-separated: 8080,8081,8082)
+		portStrs := strings.Split(portsPart, ",")
+		ports := make([]int32, 0, len(portStrs))
+		for _, portStr := range portStrs {
+			portStr = strings.TrimSpace(portStr)
+			port, err := strconv.ParseInt(portStr, 10, 32)
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid port '%s' in service-list entry '%s': %v", portStr, entry, err)
+			}
+			ports = append(ports, int32(port))
+		}
+
+		// Parse service name - support multiple formats
+		// Remove common suffixes to extract service name and namespace
+		servicePart = strings.TrimSuffix(servicePart, ".svc.cluster.local")
+		servicePart = strings.TrimSuffix(servicePart, ".svc")
+
+		nameParts := strings.Split(servicePart, ".")
+		var serviceName, namespace string
+
+		switch len(nameParts) {
+		case 1:
+			// Format: service:port
+			// Must have exactly one default namespace
+			if len(defaultNamespaces) == 0 {
+				return nil, nil, fmt.Errorf("service-list entry '%s' has no namespace, but no -n flag provided", entry)
+			}
+			if len(defaultNamespaces) > 1 {
+				return nil, nil, fmt.Errorf("service-list entry '%s' has no namespace, but multiple -n flags provided (ambiguous)", entry)
+			}
+			serviceName = nameParts[0]
+			namespace = defaultNamespaces[0]
+
+		case 2:
+			// Format: service.namespace:port
+			serviceName = nameParts[0]
+			namespace = nameParts[1]
+			namespacesMap[namespace] = true
+
+		default:
+			return nil, nil, fmt.Errorf("invalid service name format '%s' in service-list entry '%s'", servicePart, entry)
+		}
+
+		// Build key
+		key := serviceName + "." + namespace
+
+		// Check for duplicates
+		if existing, exists := filter.Specs[key]; exists {
+			// Merge ports
+			existing.Ports = append(existing.Ports, ports...)
+		} else {
+			filter.Specs[key] = &fwdservice.ServicePortSpec{
+				ServiceName: serviceName,
+				Namespace:   namespace,
+				Ports:       ports,
+			}
+		}
+	}
+
+	// Convert namespace map to slice
+	discoveredNamespaces := make([]string, 0, len(namespacesMap))
+	for ns := range namespacesMap {
+		discoveredNamespaces = append(discoveredNamespaces, ns)
+	}
+
+	return filter, discoveredNamespaces, nil
 }

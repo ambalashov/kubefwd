@@ -77,6 +77,8 @@ type ServiceFWD struct {
 
 	ForwardConfigurationPath string   // file path to IP reservation configuration
 	ForwardIPReservations    []string // cli passed IP reservations
+
+	ServiceListFilter *ServiceListFilter // filter for specific services/ports from --service-list flag
 }
 
 /*
@@ -87,6 +89,18 @@ add port map
 type PortMap struct {
 	SourcePort string
 	TargetPort string
+}
+
+// ServicePortSpec specifies a service and its allowed ports
+type ServicePortSpec struct {
+	ServiceName string  // Service name (without namespace)
+	Namespace   string  // Namespace where service lives
+	Ports       []int32 // List of ports to forward
+}
+
+// ServiceListFilter contains service-port specifications for filtering
+type ServiceListFilter struct {
+	Specs map[string]*ServicePortSpec // key: "service.namespace"
 }
 
 // String representation of a ServiceFWD returns a unique name
@@ -281,6 +295,13 @@ func (svcFwd *ServiceFWD) LoopPodsToForward(pods []v1.Pod, includePodNameInHost 
 				continue
 			}
 
+			// Skip ports not in service-list filter
+			if !svcFwd.shouldForwardPort(port.Port) {
+				log.Debugf("Skipping port %d for service %s.%s (not in service-list filter)",
+					port.Port, svcFwd.Svc.Name, svcFwd.Namespace)
+				continue
+			}
+
 			podPort = port.TargetPort.String()
 			localPort := svcFwd.getPortMap(port.Port)
 			p, err := strconv.ParseInt(localPort, 10, 32)
@@ -409,4 +430,31 @@ func (svcFwd *ServiceFWD) getPortMap(port int32) string {
 		}
 	}
 	return p
+}
+
+// shouldForwardPort checks if a port should be forwarded based on service-list filter
+func (svcFwd *ServiceFWD) shouldForwardPort(port int32) bool {
+	// No filter means forward all ports
+	if svcFwd.ServiceListFilter == nil {
+		return true
+	}
+
+	// Build key for this service
+	key := svcFwd.Svc.Name + "." + svcFwd.Namespace
+	spec, exists := svcFwd.ServiceListFilter.Specs[key]
+
+	// Service not in filter means forward all ports
+	if !exists {
+		return true
+	}
+
+	// Check if this specific port is in the allowed list
+	for _, allowedPort := range spec.Ports {
+		if port == allowedPort {
+			return true
+		}
+	}
+
+	// Port not in allowed list
+	return false
 }
