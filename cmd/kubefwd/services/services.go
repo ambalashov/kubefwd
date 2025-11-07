@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/bep/debounce"
+	"github.com/txn2/kubefwd/pkg/fwdIp"
 	"github.com/txn2/kubefwd/pkg/fwdcfg"
 	"github.com/txn2/kubefwd/pkg/fwdhost"
 	"github.com/txn2/kubefwd/pkg/fwdport"
@@ -35,6 +36,7 @@ import (
 	"github.com/txn2/kubefwd/pkg/fwdsvcregistry"
 	"github.com/txn2/kubefwd/pkg/utils"
 	"github.com/txn2/txeh"
+	"gopkg.in/yaml.v2"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -256,6 +258,23 @@ Try:
 					namespaces = []string{ctxConfig.Namespace}
 					break
 				}
+			}
+		}
+	}
+
+	// Load serviceList from config file if not provided via CLI
+	if len(serviceList) == 0 && fwdConfigurationPath != "" {
+		dat, err := os.ReadFile(fwdConfigurationPath)
+		if err != nil {
+			log.Warnf("Could not read forward configuration file: %s", err)
+		} else {
+			conf := &fwdIp.ForwardConfiguration{}
+			err = yaml.Unmarshal(dat, conf)
+			if err != nil {
+				log.Warnf("Could not parse forward configuration file: %s", err)
+			} else if len(conf.ServiceList) > 0 {
+				serviceList = conf.ServiceList
+				log.Printf("Loaded serviceList from config file: %v", serviceList)
 			}
 		}
 	}
