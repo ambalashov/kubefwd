@@ -261,11 +261,25 @@ func (svcFwd *ServiceFWD) SetupServiceForward() {
 		return
 	}
 
-	// Check if service has endpoints
+	// Check if service has endpoints with ready addresses
 	endpoints, err := svcFwd.ClientSet.CoreV1().Endpoints(svcFwd.Namespace).Get(
 		context.TODO(), serviceName, metav1.GetOptions{})
-	if err != nil || len(endpoints.Subsets) == 0 {
-		log.Warnf("Service %s.%s has no endpoints available, skipping port-forward",
+	if err != nil {
+		log.Warnf("Service %s.%s endpoint lookup failed: %v, skipping port-forward",
+			serviceName, svcFwd.Namespace, err)
+		return
+	}
+
+	hasReadyEndpoints := false
+	for _, subset := range endpoints.Subsets {
+		if len(subset.Addresses) > 0 {
+			hasReadyEndpoints = true
+			break
+		}
+	}
+
+	if !hasReadyEndpoints {
+		log.Warnf("Service %s.%s has no ready endpoints available, skipping port-forward",
 			serviceName, svcFwd.Namespace)
 		return
 	}
@@ -348,21 +362,22 @@ func (svcFwd *ServiceFWD) SetupServiceForward() {
 			ClusterN:         svcFwd.ClusterN,
 			NamespaceN:       svcFwd.NamespaceN,
 			Domain:           svcFwd.Domain,
+			Timeout:          svcFwd.Timeout,
 			ForwardToService: true, // Indicates service forwarding mode
 			ManualStopChan:   make(chan struct{}),
 			DoneChan:         make(chan struct{}),
 		}
 
-		go func() {
-			svcFwd.AddServicePod(pfo)
-			if err := pfo.PortForward(); err != nil {
+		go func(portForwardOpts *fwdport.PortForwardOpts) {
+			svcFwd.AddServicePod(portForwardOpts)
+			if err := portForwardOpts.PortForward(); err != nil {
 				select {
-				case <-pfo.ManualStopChan:
+				case <-portForwardOpts.ManualStopChan:
 				default:
 					log.Errorf("PortForward error on service %s: %s", serviceName, err.Error())
 				}
 			}
-		}()
+		}(pfo)
 	}
 }
 
@@ -519,9 +534,16 @@ func (svcFwd *ServiceFWD) LoopPodsToForward(pods []v1.Pod, includePodNameInHost 
 // AddServicePod
 func (svcFwd *ServiceFWD) AddServicePod(pfo *fwdport.PortForwardOpts) {
 	svcFwd.NamespaceServiceLock.Lock()
-	ServicePod := pfo.Service + "." + pfo.PodName
-	if _, found := svcFwd.PortForwards[ServicePod]; !found {
-		svcFwd.PortForwards[ServicePod] = pfo
+	var key string
+	if pfo.PodName == "" {
+		// Service-level forwarding - use service name as key
+		key = pfo.Service
+	} else {
+		// Pod-level forwarding - use service.pod format
+		key = pfo.Service + "." + pfo.PodName
+	}
+	if _, found := svcFwd.PortForwards[key]; !found {
+		svcFwd.PortForwards[key] = pfo
 	}
 	svcFwd.NamespaceServiceLock.Unlock()
 }

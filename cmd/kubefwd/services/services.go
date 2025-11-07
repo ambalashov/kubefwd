@@ -584,9 +584,15 @@ func ParseServiceList(serviceList []string, defaultNamespaces []string) (*fwdser
 		ports := make([]int32, 0, len(portStrs))
 		for _, portStr := range portStrs {
 			portStr = strings.TrimSpace(portStr)
+			if portStr == "" {
+				return nil, nil, fmt.Errorf("empty port in service-list entry '%s'", entry)
+			}
 			port, err := strconv.ParseInt(portStr, 10, 32)
 			if err != nil {
 				return nil, nil, fmt.Errorf("invalid port '%s' in service-list entry '%s': %v", portStr, entry, err)
+			}
+			if port < 1 || port > 65535 {
+				return nil, nil, fmt.Errorf("invalid port '%s' in service-list entry '%s': port must be between 1-65535", portStr, entry)
 			}
 			ports = append(ports, int32(port))
 		}
@@ -627,8 +633,18 @@ func ParseServiceList(serviceList []string, defaultNamespaces []string) (*fwdser
 
 		// Check for duplicates
 		if existing, exists := filter.Specs[key]; exists {
-			// Merge ports
-			existing.Ports = append(existing.Ports, ports...)
+			// Merge ports with deduplication
+			portSet := make(map[int32]bool)
+			for _, p := range existing.Ports {
+				portSet[p] = true
+			}
+			for _, p := range ports {
+				portSet[p] = true
+			}
+			existing.Ports = make([]int32, 0, len(portSet))
+			for p := range portSet {
+				existing.Ports = append(existing.Ports, p)
+			}
 		} else {
 			filter.Specs[key] = &fwdservice.ServicePortSpec{
 				ServiceName: serviceName,
