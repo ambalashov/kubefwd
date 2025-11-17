@@ -231,16 +231,6 @@ Try:
 	listOptions.LabelSelector = cmd.Flag("selector").Value.String()
 	listOptions.FieldSelector = cmd.Flag("field-selector").Value.String()
 
-	// Check mutual exclusivity: --service-list cannot be used with -l or -f
-	if len(serviceList) > 0 {
-		if listOptions.LabelSelector != "" {
-			log.Fatalf("Error: --service-list cannot be used with -l (label selector). These flags are mutually exclusive.")
-		}
-		if listOptions.FieldSelector != "" {
-			log.Fatalf("Error: --service-list cannot be used with -f (field selector). These flags are mutually exclusive.")
-		}
-	}
-
 	// if no namespaces were specified via the flags, check config from the k8s context
 	// then explicitly set one to "default"
 	if len(namespaces) < 1 {
@@ -276,6 +266,16 @@ Try:
 				serviceList = conf.ServiceList
 				log.Printf("Loaded serviceList from config file: %v", serviceList)
 			}
+		}
+	}
+
+	// Check mutual exclusivity: service-list (from CLI or config file) cannot be used with -l or -f
+	if len(serviceList) > 0 {
+		if listOptions.LabelSelector != "" {
+			log.Fatalf("Error: service-list cannot be used with -l (label selector). These flags are mutually exclusive.")
+		}
+		if listOptions.FieldSelector != "" {
+			log.Fatalf("Error: service-list cannot be used with -f (field selector). These flags are mutually exclusive.")
 		}
 	}
 
