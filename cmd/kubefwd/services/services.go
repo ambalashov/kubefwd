@@ -64,6 +64,7 @@ var fwdConfigurationPath string
 var fwdReservations []string
 var timeout int
 var serviceList []string
+var dryRun bool
 
 func init() {
 	// override error output from k8s.io/apimachinery/pkg/util/runtime
@@ -85,6 +86,7 @@ func init() {
 	Cmd.Flags().StringVarP(&fwdConfigurationPath, "fwd-conf", "z", "", "Define an IP reservation configuration")
 	Cmd.Flags().IntVarP(&timeout, "timeout", "t", 300, "Specify a timeout seconds for the port forwarding.")
 	Cmd.Flags().StringSliceVar(&serviceList, "service-list", []string{}, "Specify services with specific ports to forward (format: service:port or service.namespace:port). Multiple ports: service:port1,port2")
+	Cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print port-forward candidates without actually forwarding")
 
 }
 
@@ -163,10 +165,13 @@ func runCmd(cmd *cobra.Command, _ []string) {
 		log.SetLevel(log.DebugLevel)
 	}
 
-	hasRoot, err := utils.CheckRoot()
+	// Skip root check and hostfile operations in dry-run mode
+	var hostFile *txeh.Hosts
+	if !dryRun {
+		hasRoot, err := utils.CheckRoot()
 
-	if !hasRoot {
-		log.Errorf(`
+		if !hasRoot {
+			log.Errorf(`
 This program requires superuser privileges to run. These
 privileges are required to add IP address aliases to your
 loopback interface. Superuser privileges are also needed
@@ -177,28 +182,33 @@ Try:
  - Running a shell with administrator rights (Windows)
 
 `)
-		if err != nil {
-			log.Fatalf("Root check failure: %s", err.Error())
+			if err != nil {
+				log.Fatalf("Root check failure: %s", err.Error())
+			}
+			return
 		}
-		return
+
+		log.Println("Press [Ctrl-C] to stop forwarding.")
+		log.Println("'cat /etc/hosts' to see all host entries.")
+
+		hostFile, err = txeh.NewHostsDefault()
+		if err != nil {
+			log.Fatalf("HostFile error: %s", err.Error())
+		}
+
+		log.Printf("Loaded hosts file %s\n", hostFile.ReadFilePath)
+
+		msg, err := fwdhost.BackupHostFile(hostFile)
+		if err != nil {
+			log.Fatalf("Error backing up hostfile: %s\n", err.Error())
+		}
+
+		log.Printf("HostFile management: %s", msg)
+	} else {
+		log.Println("DRY RUN MODE - No actual port-forwarding will be performed")
+		log.Println("Showing port-forward candidates that would be created:")
+		log.Println()
 	}
-
-	log.Println("Press [Ctrl-C] to stop forwarding.")
-	log.Println("'cat /etc/hosts' to see all host entries.")
-
-	hostFile, err := txeh.NewHostsDefault()
-	if err != nil {
-		log.Fatalf("HostFile error: %s", err.Error())
-	}
-
-	log.Printf("Loaded hosts file %s\n", hostFile.ReadFilePath)
-
-	msg, err := fwdhost.BackupHostFile(hostFile)
-	if err != nil {
-		log.Fatalf("Error backing up hostfile: %s\n", err.Error())
-	}
-
-	log.Printf("HostFile management: %s", msg)
 
 	if domain != "" {
 		log.Printf("Adding custom domain %s to all forwarded entries\n", domain)
@@ -256,16 +266,20 @@ Try:
 	if len(serviceList) == 0 && fwdConfigurationPath != "" {
 		dat, err := os.ReadFile(fwdConfigurationPath)
 		if err != nil {
-			log.Warnf("Could not read forward configuration file: %s", err)
+			log.Fatalf("Error: could not read forward configuration file %s: %s", fwdConfigurationPath, err)
+		}
+
+		conf := &fwdIp.ForwardConfiguration{}
+		err = yaml.Unmarshal(dat, conf)
+		if err != nil {
+			log.Fatalf("Error: could not parse forward configuration file %s: %s", fwdConfigurationPath, err)
+		}
+
+		if len(conf.ServiceList) > 0 {
+			serviceList = conf.ServiceList
+			log.Printf("Loaded serviceList from config file: %v", serviceList)
 		} else {
-			conf := &fwdIp.ForwardConfiguration{}
-			err = yaml.Unmarshal(dat, conf)
-			if err != nil {
-				log.Warnf("Could not parse forward configuration file: %s", err)
-			} else if len(conf.ServiceList) > 0 {
-				serviceList = conf.ServiceList
-				log.Printf("Loaded serviceList from config file: %v", serviceList)
-			}
+			log.Warnf("Warning: configuration file %s has no serviceList entries", fwdConfigurationPath)
 		}
 	}
 
@@ -289,6 +303,21 @@ Try:
 		}
 		log.Printf("Service-list filter active: forwarding %d service(s) across %d namespace(s)",
 			len(svcListFilter.Specs), len(namespaces))
+
+		// Validate that we have something to forward
+		if len(svcListFilter.Specs) == 0 {
+			log.Fatalf("Error: serviceList filter is empty. No services will be forwarded. Check your configuration.")
+		}
+
+		// In dry-run mode, show what will be forwarded for visibility
+		if dryRun {
+			log.Println()
+			log.Println("Services in filter:")
+			for key, spec := range svcListFilter.Specs {
+				log.Printf("  - %s ports %v", key, spec.Ports)
+			}
+			log.Println()
+		}
 	}
 
 	stopListenCh := make(chan struct{})
@@ -369,6 +398,7 @@ Try:
 				ManualStopChannel: stopListenCh,
 				PortMapping:       mappings,
 				ServiceListFilter: svcListFilter,
+				DryRun:            dryRun,
 			}
 
 			go func(npo NamespaceOpts) {
@@ -423,6 +453,9 @@ type NamespaceOpts struct {
 
 	// ServiceListFilter filters specific services and ports from --service-list flag
 	ServiceListFilter *fwdservice.ServiceListFilter
+
+	// DryRun indicates that no actual port-forwarding should be performed
+	DryRun bool
 }
 
 // watchServiceEvents sets up event handlers to act on service-related events.
@@ -512,6 +545,7 @@ func (opts *NamespaceOpts) AddServiceHandler(obj interface{}) {
 		ServiceListFilter:        opts.ServiceListFilter,
 		// Enable service forwarding when --service-list is used and service is not headless
 		ForwardToService: opts.ServiceListFilter != nil && svc.Spec.ClusterIP != "None",
+		DryRun:           opts.DryRun,
 	}
 
 	// Add the service to the catalog of services being forwarded

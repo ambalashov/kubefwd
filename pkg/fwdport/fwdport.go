@@ -96,6 +96,9 @@ type PortForwardOpts struct {
 
 	// ServiceName is the name of the service to forward to (when ForwardToService is true)
 	ServiceName string
+
+	// DryRun indicates that no actual port-forwarding should be performed
+	DryRun bool
 }
 
 type pingingDialer struct {
@@ -139,6 +142,14 @@ func (p pingingDialer) Dial(protocols ...string) (httpstream.Connection, string,
 // or after a cancellation signal has been received.
 func (pfo *PortForwardOpts) PortForward() error {
 	defer close(pfo.DoneChan)
+
+	// DRY RUN MODE: Just print what would be forwarded and return
+	if pfo.DryRun {
+		pfo.printDryRunCandidate()
+		// Wait for stop signal in dry-run mode
+		<-pfo.ManualStopChan
+		return nil
+	}
 
 	transport, upgrader, err := spdy.RoundTripperFor(&pfo.Config)
 	if err != nil {
@@ -520,4 +531,67 @@ func (pfo *PortForwardOpts) Stop() {
 	default:
 	}
 	close(pfo.ManualStopChan)
+}
+
+// printDryRunCandidate prints information about what would be forwarded in dry-run mode
+func (pfo *PortForwardOpts) printDryRunCandidate() {
+	// Build hostname(s) that would be added
+	hostnames := pfo.buildHostnames()
+
+	var targetInfo string
+	if pfo.ForwardToService {
+		targetInfo = fmt.Sprintf("service %s", pfo.ServiceName)
+	} else {
+		targetInfo = fmt.Sprintf("pod %s", pfo.PodName)
+	}
+
+	log.Printf("[DRY-RUN] Would forward: %s:%s -> %s:%s",
+		pfo.LocalIp.String(),
+		pfo.LocalPort,
+		targetInfo,
+		pfo.PodPort,
+	)
+	log.Printf("[DRY-RUN]   Hostnames: %s", hostnames)
+	log.Printf("[DRY-RUN]   Namespace: %s, Context: %s", pfo.Namespace, pfo.Context)
+	log.Println()
+}
+
+// buildHostnames returns a string with all hostnames that would be added to /etc/hosts
+func (pfo *PortForwardOpts) buildHostnames() string {
+	var hostnames []string
+
+	// bare service name
+	if pfo.ClusterN == 0 && pfo.NamespaceN == 0 {
+		hostnames = append(hostnames, pfo.Service)
+
+		if pfo.Domain != "" {
+			hostnames = append(hostnames, fmt.Sprintf("%s.%s", pfo.Service, pfo.Domain))
+		}
+	}
+
+	// alternate cluster / first namespace
+	if pfo.ClusterN > 0 && pfo.NamespaceN == 0 {
+		hostnames = append(hostnames, fmt.Sprintf("%s.%s", pfo.Service, pfo.Context))
+	}
+
+	// namespaced without cluster
+	if pfo.ClusterN == 0 {
+		hostnames = append(hostnames,
+			fmt.Sprintf("%s.%s", pfo.Service, pfo.Namespace),
+			fmt.Sprintf("%s.%s.svc", pfo.Service, pfo.Namespace),
+			fmt.Sprintf("%s.%s.svc.cluster.local", pfo.Service, pfo.Namespace),
+		)
+
+		if pfo.Domain != "" {
+			hostnames = append(hostnames, fmt.Sprintf("%s.%s.svc.cluster.%s", pfo.Service, pfo.Namespace, pfo.Domain))
+		}
+	}
+
+	hostnames = append(hostnames,
+		fmt.Sprintf("%s.%s.%s", pfo.Service, pfo.Namespace, pfo.Context),
+		fmt.Sprintf("%s.%s.svc.%s", pfo.Service, pfo.Namespace, pfo.Context),
+		fmt.Sprintf("%s.%s.svc.cluster.%s", pfo.Service, pfo.Namespace, pfo.Context),
+	)
+
+	return strings.Join(hostnames, ", ")
 }
