@@ -3,6 +3,7 @@ package fwdservice
 import (
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"sync"
 	"time"
@@ -83,6 +84,9 @@ type ServiceFWD struct {
 	// ForwardToService indicates we should forward to the service endpoint
 	// directly instead of individual pods (enabled for --service-list on non-headless services)
 	ForwardToService bool
+
+	// DryRun indicates that no actual port-forwarding should be performed
+	DryRun bool
 }
 
 /*
@@ -144,7 +148,7 @@ func (svcFwd *ServiceFWD) GetPodsForService() []v1.Pod {
 // the forwarding setup for that or those pod(s). It will remove pods in-mem
 // that are no longer returned by k8s, should these not be correctly deleted.
 func (svcFwd *ServiceFWD) SyncPodForwards(force bool) {
-	sync := func() {
+	runSync := func() {
 
 		defer func() { svcFwd.LastSyncedAt = time.Now() }()
 
@@ -158,7 +162,7 @@ func (svcFwd *ServiceFWD) SyncPodForwards(force bool) {
 		// EXISTING: Pod-based forwarding for headless services or when not using service forwarding
 		k8sPods := svcFwd.GetPodsForService()
 
-		// If no pods are found currently. Will try again next re-sync period.
+		// If no pods are found currently. Will try again next re-runSync period.
 		if len(k8sPods) == 0 {
 			log.Warnf("WARNING: No Running Pods returned for service %s", svcFwd)
 			return
@@ -240,10 +244,10 @@ func (svcFwd *ServiceFWD) SyncPodForwards(force bool) {
 		svcFwd.SyncDebouncer(func() {})
 
 		// Do the syncing work
-		sync()
+		runSync()
 	} else {
-		// Queue sync
-		svcFwd.SyncDebouncer(sync)
+		// Queue runSync
+		svcFwd.SyncDebouncer(runSync)
 	}
 }
 
@@ -300,10 +304,22 @@ func (svcFwd *ServiceFWD) SetupServiceForward() {
 		ForwardIPReservations:    svcFwd.ForwardIPReservations,
 	}
 
-	localIp, err := fwdnet.ReadyInterface(opts)
-	if err != nil {
-		log.Warnf("WARNING: error readying interface for service %s: %s\n", svcFwd, err)
-		return
+	var localIp net.IP
+
+	if !svcFwd.DryRun {
+		// Normal mode: Allocate IP and create network interface alias
+		localIp, err = fwdnet.ReadyInterface(opts)
+		if err != nil {
+			log.Warnf("WARNING: error readying interface for service %s: %s\n", svcFwd, err)
+			return
+		}
+	} else {
+		// Dry-run mode: Only allocate IP for display, don't create interface alias
+		localIp, err = fwdIp.GetIp(opts)
+		if err != nil {
+			log.Warnf("WARNING: error allocating IP for service %s: %s\n", svcFwd, err)
+			return
+		}
 	}
 
 	serviceHostName := serviceName
@@ -336,13 +352,23 @@ func (svcFwd *ServiceFWD) SetupServiceForward() {
 		podPort := strconv.Itoa(int(port.Port))
 		localPort := svcFwd.getPortMap(port.Port)
 
-		log.Printf("Port-Forward: %16s %s:%s to service %s:%d\n",
-			localIp.String(),
-			serviceHostName,
-			localPort,
-			serviceName,
-			port.Port,
-		)
+		if svcFwd.DryRun {
+			log.Printf("[DRY-RUN] Would forward: %s:%s -> service %s:%d",
+				localIp.String(),
+				localPort,
+				serviceName,
+				port.Port,
+			)
+			log.Printf("[DRY-RUN]   Hostname: %s", serviceHostName)
+		} else {
+			log.Printf("Port-Forward: %16s %s:%s to service %s:%d\n",
+				localIp.String(),
+				serviceHostName,
+				localPort,
+				serviceName,
+				port.Port,
+			)
+		}
 
 		pfo := &fwdport.PortForwardOpts{
 			Out:              publisher,
@@ -366,6 +392,7 @@ func (svcFwd *ServiceFWD) SetupServiceForward() {
 			ForwardToService: true, // Indicates service forwarding mode
 			ManualStopChan:   make(chan struct{}),
 			DoneChan:         make(chan struct{}),
+			DryRun:           svcFwd.DryRun,
 		}
 
 		go func(portForwardOpts *fwdport.PortForwardOpts) {
@@ -421,9 +448,22 @@ func (svcFwd *ServiceFWD) LoopPodsToForward(pods []v1.Pod, includePodNameInHost 
 			ForwardConfigurationPath: svcFwd.ForwardConfigurationPath,
 			ForwardIPReservations:    svcFwd.ForwardIPReservations,
 		}
-		localIp, err := fwdnet.ReadyInterface(opts)
-		if err != nil {
-			log.Warnf("WARNING: error readying interface: %s\n", err)
+
+		var localIp net.IP
+		var err error
+
+		if !svcFwd.DryRun {
+			// Normal mode: Allocate IP and create network interface alias
+			localIp, err = fwdnet.ReadyInterface(opts)
+			if err != nil {
+				log.Warnf("WARNING: error readying interface: %s\n", err)
+			}
+		} else {
+			// Dry-run mode: Only allocate IP for display, don't create interface alias
+			localIp, err = fwdIp.GetIp(opts)
+			if err != nil {
+				log.Warnf("WARNING: error allocating IP: %s\n", err)
+			}
 		}
 
 		// if this is not the first namespace on the
@@ -478,13 +518,23 @@ func (svcFwd *ServiceFWD) LoopPodsToForward(pods []v1.Pod, includePodNameInHost 
 				svcName,
 			)
 
-			log.Printf("Port-Forward: %16s %s:%d to pod %s:%s\n",
-				localIp.String(),
-				serviceHostName,
-				port.Port,
-				pod.Name,
-				podPort,
-			)
+			if svcFwd.DryRun {
+				log.Printf("[DRY-RUN] Would forward: %s:%d -> pod %s:%s",
+					localIp.String(),
+					port.Port,
+					pod.Name,
+					podPort,
+				)
+				log.Printf("[DRY-RUN]   Hostname: %s", serviceHostName)
+			} else {
+				log.Printf("Port-Forward: %16s %s:%d to pod %s:%s\n",
+					localIp.String(),
+					serviceHostName,
+					port.Port,
+					pod.Name,
+					podPort,
+				)
+			}
 
 			pfo := &fwdport.PortForwardOpts{
 				Out:        publisher,
@@ -506,6 +556,7 @@ func (svcFwd *ServiceFWD) LoopPodsToForward(pods []v1.Pod, includePodNameInHost 
 
 				ManualStopChan: make(chan struct{}),
 				DoneChan:       make(chan struct{}),
+				DryRun:         svcFwd.DryRun,
 			}
 
 			// Fire and forget. The stopping is done in the service.Shutdown() method.
